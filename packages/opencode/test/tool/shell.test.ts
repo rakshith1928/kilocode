@@ -1169,6 +1169,81 @@ describe("tool.shell abort", () => {
   )
 })
 
+describe("tool.shell signal termination", () => {
+  if (process.platform === "win32") {
+    it.live("skip signal-termination tests on Windows", () => Effect.void)
+    return
+  }
+
+  for (const item of shells.filter((s) => s.label !== "cmd")) {
+    it.live(
+      `completes when child terminates via SIGSEGV [${item.label}]`,
+      () =>
+        withShell(
+          item,
+          runIn(
+            projectRoot,
+            Effect.gen(function* () {
+              const result = yield* run({
+                command: "kill -s SIGSEGV $$",
+                description: "Segfault self",
+                timeout: 1500,
+              })
+              expect(result.metadata.exit).toBeNull()
+              expect(result.output).toContain("SIGSEGV")
+              expect(result.output).not.toContain("User aborted the command")
+              expect(result.output).not.toContain("shell tool terminated command")
+            }),
+          ),
+        ),
+      8_000,
+    )
+
+    it.live(
+      `completes when child terminates via SIGABRT [${item.label}]`,
+      () =>
+        withShell(
+          item,
+          runIn(
+            projectRoot,
+            Effect.gen(function* () {
+              const result = yield* run({
+                command: "kill -s SIGABRT $$",
+                description: "Abort self",
+                timeout: 1500,
+              })
+              expect(result.metadata.exit).toBeNull()
+              expect(result.output).toContain("SIGABRT")
+              expect(result.output).not.toContain("User aborted the command")
+              expect(result.output).not.toContain("shell tool terminated command")
+            }),
+          ),
+        ),
+      8_000,
+    )
+
+    it.live(
+      `non-zero exit still returns numeric code [${item.label}]`,
+      () =>
+        withShell(
+          item,
+          runIn(
+            projectRoot,
+            Effect.gen(function* () {
+              const result = yield* run({
+                command: "exit 7",
+                description: "Exit with code 7",
+              })
+              expect(result.metadata.exit).toBe(7)
+              expect(result.output).not.toMatch(/SIG[A-Z]+/)
+            }),
+          ),
+        ),
+      8_000,
+    )
+  }
+})
+
 describe("tool.shell truncation", () => {
   it.live("truncates output exceeding line limit", () =>
     runIn(

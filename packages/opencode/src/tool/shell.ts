@@ -1,4 +1,5 @@
 import { Effect, Fiber, Stream } from "effect" // kilocode_change - Fiber
+import * as PlatformError from "effect/PlatformError" // kilocode_change - signal-terminated exit handling
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -529,6 +530,7 @@ export const ShellTool = Tool.define(
       let cut = false
       let expired = false
       let aborted = false
+      let terminatedBySignal: NodeJS.Signals | null = null // kilocode_change - surface OS signal in <shell_metadata>
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -626,9 +628,28 @@ export const ShellTool = Tool.define(
           const timeout = Effect.sleep(`${CommandTimeout.duration(input.timeout)} millis`) // kilocode_change
 
           const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+            // kilocode_change start - convert signal-based exit failures into a synthetic exit so the
+            // race completes immediately instead of waiting for abort/timeout. The spawner surfaces
+            // signal terminations as a PlatformError ("Process interrupted due to receipt of signal"),
+            // which Effect.raceAll would otherwise drop while waiting on the never-failing sleep effects.
+            handle.exitCode.pipe(
+              Effect.map((code) => ({
+                kind: "exit" as const,
+                code,
+                signal: null as NodeJS.Signals | null,
+              })),
+              Effect.catch((err: PlatformError.PlatformError) => {
+                const m = /'([^']+)'/.exec(err.message)
+                return Effect.succeed({
+                  kind: "exit" as const,
+                  code: null,
+                  signal: (m?.[1] ?? null) as NodeJS.Signals | null,
+                })
+              }),
+            ),
+            // kilocode_change end
+            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null, signal: null }))),
+            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null, signal: null }))),
           ])
 
           if (exit.kind === "abort") {
@@ -639,6 +660,9 @@ export const ShellTool = Tool.define(
             expired = true
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
+          // kilocode_change start - capture OS signal so it can be surfaced in <shell_metadata>
+          if (exit.kind === "exit") terminatedBySignal = exit.signal
+          // kilocode_change end
 
           // kilocode_change start - closing the scope interrupts the reader fiber, which can drop
           // buffered output that arrived just before the process exited. Wait for the stream to
@@ -660,6 +684,12 @@ export const ShellTool = Tool.define(
         // kilocode_change end
       }
       if (aborted) meta.push("User aborted the command")
+      // kilocode_change start - surface the OS signal that terminated the child so the agent can
+      // diagnose crashes (e.g. SIGSEGV from a native dependency) without parsing exit=null themselves.
+      if (terminatedBySignal) {
+        meta.push(`Process terminated by signal: ${terminatedBySignal}`)
+      }
+      // kilocode_change end
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true
